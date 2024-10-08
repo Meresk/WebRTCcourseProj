@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Screen Sharing with WebRTC</title>
+</head>
+<body>
+<h1>Screen Sharing with WebRTC</h1>
+<button id="start">Start Sharing</button>
+<video id="video" autoplay playsinline></video>
+
+<script>
+    const video = document.getElementById('video');
+    let localStream;
+
+    document.getElementById('start').onclick = async () => {
+        localStream = await navigator.mediaDevices.getDisplayMedia({ video: true });
+        video.srcObject = localStream;
+
+        const ws = new WebSocket('ws://localhost:8080/ws');
+
+        ws.onopen = async () => {
+            const pc = new RTCPeerConnection();
+
+            localStream.getTracks().forEach(track => {
+                pc.addTrack(track, localStream);
+            });
+
+            pc.onicecandidate = event => {
+                if (event.candidate) {
+                    ws.send(JSON.stringify({ candidate: event.candidate.toJSON() }));
+                }
+            };
+
+            pc.ontrack = event => {
+                const remoteVideo = document.createElement('video');
+                remoteVideo.srcObject = event.streams[0];
+                remoteVideo.autoplay = true;
+                document.body.appendChild(remoteVideo);
+            };
+
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+            ws.send(JSON.stringify({ type: 'offer', sdp: offer.sdp }));
+        };
+
+        ws.onmessage = async event => {
+            const message = JSON.parse(event.data);
+
+            if (message.candidate) {
+                await pc.addIceCandidate(new RTCIceCandidate(message.candidate));
+            } else if (message.type === 'answer') {
+                await pc.setRemoteDescription(new RTCSessionDescription(message));
+            }
+        };
+    };
+</script>
+</body>
+</html>
