@@ -1,0 +1,190 @@
+Да, можно настроить этот код так, чтобы только один пользователь (например, "учитель") мог отправлять видеопоток, а остальные пользователи ("ученики") могли только принимать его. В этом случае ты должен контролировать, кто может отправлять медиапоток, а кто только может его получать.
+
+Это можно реализовать с помощью дискриминации ролей на сервере. Например, сервер может определять, кто является "учителем" (отправителем видеопотока), и ограничивать другие пользователи только получением этого потока. Вот как можно это сделать.
+
+1. Добавление роли для участников (учитель и ученики)
+Для начала, нужно добавить механизм, который позволит отличать "учителя" от "учеников". Это можно сделать, например, с использованием WebSocket-сообщений, где в процессе подключения будет указано, кто является "учителем". Например, мы можем передать эту информацию в JSON-сообщении с данными роли.
+
+2. Ограничение на отправку видеопотока
+Только участник с ролью "учитель" будет добавлять свой видеопоток в глобальный список треков, а все остальные участники ("ученики") будут только подписываться на этот поток.
+
+Вот как можно изменить код для реализации этой логики:
+
+Измененный код:
+1. Определение ролей и добавление роли в структуру данных
+Мы добавим поле role в структуру peerConnectionState, чтобы хранить роль каждого участника.
+
+go
+Copy code
+type peerConnectionState struct {
+    peerConnection *webrtc.PeerConnection
+    websocket      *threadSafeWriter
+    role           string // "teacher" или "student"
+}
+2. Обработка WebSocket-сообщений при подключении
+В функции websocketHandler добавим обработку роли при подключении пользователя. Если роль не указана, она будет по умолчанию "student".
+
+go
+Copy code
+func websocketHandler(w http.ResponseWriter, r *http.Request) {
+    // Upgrade HTTP request to WebSocket
+    unsafeConn, err := upgrader.Upgrade(w, r, nil)
+    if err != nil {
+        log.Print("upgrade:", err)
+        return
+    }
+
+    c := &threadSafeWriter{unsafeConn, sync.Mutex{}}
+
+    // defer закроет WebSocket соединение, когда функция завершится.
+    defer c.Close()
+
+    // Извлекаем роль из запроса, по умолчанию "student"
+    role := "student"
+    if r.URL.Query().Get("role") == "teacher" {
+        role = "teacher"
+    }
+
+    // Создаем PeerConnection
+    peerConnection, err := webrtc.NewPeerConnection(webrtc.Configuration{})
+    if err != nil {
+        log.Print(err)
+        return
+    }
+
+    // defer закроет PeerConnection, когда функция завершится.
+    defer peerConnection.Close()
+
+    // Добавляем трансиверы для аудио и видео
+    for _, typ := range []webrtc.RTPCodecType{webrtc.RTPCodecTypeVideo, webrtc.RTPCodecTypeAudio} {
+        if _, err := peerConnection.AddTransceiverFromKind(typ, webrtc.RTPTransceiverInit{
+            Direction: webrtc.RTPTransceiverDirectionRecvonly, // Только получать
+        }); err != nil {
+            log.Print(err)
+            return
+        }
+    }
+
+    // Добавляем PeerConnection в глобальный список, учитывая его роль
+    listLock.Lock()
+    peerConnections = append(peerConnections, peerConnectionState{peerConnection, c, role})
+    listLock.Unlock()
+
+    // Если роль "учитель", добавляем трек и раздаем его всем ученикам
+    if role == "teacher" {
+        // Добавляем видео трек
+        peerConnection.OnTrack(func(t *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
+            trackLocal := addTrack(t) // Добавляем трек в список
+            defer removeTrack(trackLocal)
+
+            buf := make([]byte, 1500)
+            rtpPkt := &rtp.Packet{}
+            for {
+                i, _, err := t.Read(buf)
+                if err != nil {
+                    return
+                }
+
+                if err = rtpPkt.Unmarshal(buf[:i]); err != nil {
+                    log.Println(err)
+                    return
+                }
+
+                // Рассылаем RTP пакеты всем ученикам
+                listLock.RLock()
+                for _, peer := range peerConnections {
+                    if peer.role == "student" {
+                        // Учащиеся только получают поток
+                        if err := peer.peerConnection.WriteRTP(rtpPkt); err != nil {
+                            log.Println("Error sending RTP:", err)
+                        }
+                    }
+                }
+                listLock.RUnlock()
+            }
+        })
+    }
+
+    // Обработка ICE кандидатов и других сигналов (например, кандидаты, ответы и т. д.)
+    handleICECandidates(peerConnection, c)
+
+    // Чтение сообщений от клиента и выполнение соответствующих действий
+    handleWebSocketMessages(peerConnection, c)
+}
+3. Фильтрация по роли при распространении потоков
+Когда участник подключается как "учитель", он может отправлять поток всем участникам. "Ученики" получают только поток, но не могут его отправлять.
+
+В блоке, где отправляются RTP пакеты, мы проверяем роль участника перед отправкой данных.
+Мы добавляем только тех участников, у которых роль student, в список получателей RTP-пакетов.
+4. Описание функций для обработки сообщений и ICE кандидатов
+Вызовы функций handleICECandidates и handleWebSocketMessages могут остаться без изменений. Это функции, которые обрабатывают сообщения о кандидате ICE и прочее, что не зависит от роли.
+
+go
+Copy code
+// Обработка ICE кандидатов
+func handleICECandidates(peerConnection *webrtc.PeerConnection, c *threadSafeWriter) {
+    peerConnection.OnICECandidate(func(i *webrtc.ICECandidate) {
+        if i == nil {
+            return
+        }
+
+        candidateString, err := json.Marshal(i.ToJSON())
+        if err != nil {
+            log.Println(err)
+            return
+        }
+
+        if writeErr := c.WriteJSON(&websocketMessage{
+            Event: "candidate",
+            Data:  string(candidateString),
+        }); writeErr != nil {
+            log.Println(writeErr)
+        }
+    })
+}
+
+// Обработка сообщений WebSocket (например, "candidate", "answer")
+func handleWebSocketMessages(peerConnection *webrtc.PeerConnection, c *threadSafeWriter) {
+    message := &websocketMessage{}
+    for {
+        _, raw, err := c.ReadMessage()
+        if err != nil {
+            log.Println(err)
+            return
+        } else if err := json.Unmarshal(raw, &message); err != nil {
+            log.Println(err)
+            return
+        }
+
+        switch message.Event {
+        case "candidate":
+            candidate := webrtc.ICECandidateInit{}
+            if err := json.Unmarshal([]byte(message.Data), &candidate); err != nil {
+                log.Println(err)
+                return
+            }
+
+            if err := peerConnection.AddICECandidate(candidate); err != nil {
+                log.Println(err)
+                return
+            }
+        case "answer":
+            answer := webrtc.SessionDescription{}
+            if err := json.Unmarshal([]byte(message.Data), &answer); err != nil {
+                log.Println(err)
+                return
+            }
+
+            if err := peerConnection.SetRemoteDescription(answer); err != nil {
+                log.Println(err)
+                return
+            }
+        }
+    }
+}
+5. Заключение
+Теперь у нас есть простая система с ролями:
+
+Учитель (роль "teacher") может отправлять видеопоток и рассылает его всем "ученикам".
+Ученики (роль "student") могут только принимать этот видеопоток, но не могут его отправлять.
+Такое разделение ролей позволяет реализовать функциональность, аналогичную видеоконференциям, где один участник может быть ведущим (учителем), а остальные — зрителями (учениками).
