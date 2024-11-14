@@ -84,7 +84,12 @@ func main() {
 }
 
 // Add to list of tracks and fire renegotation for all PeerConnections
-func addTrack(t *webrtc.TrackRemote) *webrtc.TrackLocalStaticRTP {
+func addTrack(t *webrtc.TrackRemote, role string) *webrtc.TrackLocalStaticRTP {
+
+	if role == "student" {
+		return nil // Ученик не может добавлять треки
+	}
+
 	listLock.Lock()
 	defer func() {
 		listLock.Unlock()
@@ -239,6 +244,15 @@ func dispatchKeyFrame() {
 // Обработчик для WebSocket соединений. Он обновляет HTTP-запрос до WebSocket. Если произойдет ошибка, она будет зафиксирована через log.Print.
 // Создает threadSafeWriter, чтобы обеспечить потокобезопасный доступ к WebSocket.
 func websocketHandler(w http.ResponseWriter, r *http.Request) {
+
+	// Временное чтение параметра role из запроса
+	role := r.URL.Query().Get("role")
+
+	if role != "teacher" && role != "student" {
+		http.Error(w, "invalid role", http.StatusForbidden)
+		return
+	}
+
 	// Upgrade HTTP request to Websocket
 	unsafeConn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -261,15 +275,35 @@ func websocketHandler(w http.ResponseWriter, r *http.Request) {
 	// defer закрывает PeerConnection, когда функция завершится.
 	defer peerConnection.Close() //nolint
 
-	// Добавляет один аудиотрек и один видеотрек для получения, создавая трансиверы с направлением "recvonly".
-	for _, typ := range []webrtc.RTPCodecType{webrtc.RTPCodecTypeVideo, webrtc.RTPCodecTypeAudio} {
-		if _, err := peerConnection.AddTransceiverFromKind(typ, webrtc.RTPTransceiverInit{
-			Direction: webrtc.RTPTransceiverDirectionRecvonly,
-		}); err != nil {
-			log.Print(err)
-			return
+	if role == "teacher" {
+		for _, typ := range []webrtc.RTPCodecType{webrtc.RTPCodecTypeVideo, webrtc.RTPCodecTypeAudio} {
+			if _, err := peerConnection.AddTransceiverFromKind(typ, webrtc.RTPTransceiverInit{
+				Direction: webrtc.RTPTransceiverDirectionSendrecv,
+			}); err != nil {
+				log.Print(err)
+				return
+			}
+		}
+	} else {
+		for _, typ := range []webrtc.RTPCodecType{webrtc.RTPCodecTypeVideo, webrtc.RTPCodecTypeAudio} {
+			if _, err := peerConnection.AddTransceiverFromKind(typ, webrtc.RTPTransceiverInit{
+				Direction: webrtc.RTPTransceiverDirectionRecvonly,
+			}); err != nil {
+				log.Print(err)
+				return
+			}
 		}
 	}
+
+	// Добавляет один аудиотрек и один видеотрек для получения, создавая трансиверы с направлением "recvonly".
+	//for _, typ := range []webrtc.RTPCodecType{webrtc.RTPCodecTypeVideo, webrtc.RTPCodecTypeAudio} {
+	//	if _, err := peerConnection.AddTransceiverFromKind(typ, webrtc.RTPTransceiverInit{
+	//		Direction: webrtc.RTPTransceiverDirectionRecvonly,
+	//	}); err != nil {
+	//		log.Print(err)
+	//		return
+	//	}
+	//}
 
 	// Добавление PeerConnection в глобальный список
 	// Блокирует доступ к списку peerConnections, добавляет новое соединение в глобальный список и освобождает блокировку.
@@ -319,9 +353,18 @@ func websocketHandler(w http.ResponseWriter, r *http.Request) {
 	// Устанавливает обработчик на входящие треки. При получении трека вызывается функция addTrack для добавления его в глобальный список.
 	// Создается буфер для чтения данных RTP и объект RTP-пакета.
 	peerConnection.OnTrack(func(t *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
-		// Create a track to fan out our incoming video to all peers
-		trackLocal := addTrack(t)
+
+		// Только если это учитель, добавляем новый трек
+		trackLocal := addTrack(t, role)
+		if trackLocal == nil {
+			// Ученик не может добавлять трек
+			return
+		}
 		defer removeTrack(trackLocal)
+
+		// Create a track to fan out our incoming video to all peers
+		//trackLocal := addTrack(t)
+		//		//defer removeTrack(trackLocal)
 
 		buf := make([]byte, 1500)
 		rtpPkt := &rtp.Packet{}

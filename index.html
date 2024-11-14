@@ -1,104 +1,225 @@
 <!DOCTYPE html>
-<html>
-<!--
-  SPDX-FileCopyrightText: 2023 The Pion community <https://pion.ly>
-  SPDX-License-Identifier: MIT
--->
-
+<html lang="ru">
 <head>
-    <meta charset="utf-8">
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Трансляция экрана</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 0;
+        }
+        #video-container {
+            display: flex;
+            justify-content: center;
+            margin-top: 20px;
+        }
+        video {
+            width: 90%; /* Увеличено с 80% до 90% */
+            max-width: 1400px; /* Установлен максимальный размер видео */
+            height: auto; /* Поддерживает пропорции экрана */
+            border: 1px solid #ccc;
+            margin: 10px;
+            border-radius: 10px; /* Скругленные углы */
+        }
+        #controls {
+            text-align: center;
+            margin-top: 20px;
+        }
+        button {
+            padding: 10px 20px;
+            margin: 10px;
+            font-size: 16px;
+            cursor: pointer;
+            background-color: #007BFF;
+            color: white;
+            border: none;
+            border-radius: 5px;
+        }
+        button:disabled {
+            background-color: #ccc;
+        }
+        .hidden {
+            display: none;
+        }
+    </style>
 </head>
 <body>
-<h3> Local Video </h3>
-<video id="localVideo" width="160" height="120" autoplay muted></video> <br />
 
-<h3> Remote Video </h3>
-<div id="remoteVideos"></div> <br />
+<div id="controls">
+    <h1>Добро пожаловать в видеоконференцию</h1>
+    <div id="role-selection">
+        <button onclick="setRole('teacher')">Я учитель</button>
+        <button onclick="setRole('student')">Я ученик</button>
+    </div>
 
-<h3> Logs </h3>
-<div id="logs"></div>
+    <div id="teacher-controls" class="hidden">
+        <h2>Управление трансляцией</h2>
+        <button id="start-broadcast" onclick="startBroadcast()">Начать трансляцию экрана</button>
+        <button id="stop-broadcast" class="hidden" onclick="stopBroadcast()">Остановить трансляцию</button>
+    </div>
 
-
-</body>
+    <div id="student-view" class="hidden">
+        <h2>Просмотр трансляции</h2>
+        <div id="video-container" >
+            <video id="video-player" autoplay></video>
+        </div>
+    </div>
+</div>
 
 <script>
-    navigator.mediaDevices.getDisplayMedia({ video: true, audio: true })
-        .then(stream => {
-            let pc = new RTCPeerConnection();
+    let role = null;
+    let socket = null;
+    let peerConnection = null;
+    let videoElement = document.getElementById('video-player');
+    let screenStream = null;
 
-            pc.ontrack = function (event) {
-                if (event.track.kind === 'audio') {
-                    return;
-                }
+    // Функция для выбора роли (учитель/ученик)
+    function setRole(selectedRole) {
+        role = selectedRole;
+        document.getElementById('role-selection').classList.add('hidden');
 
-                let el = document.createElement(event.track.kind);
-                el.srcObject = event.streams[0];
-                el.autoplay = true;
-                el.controls = true;
-                document.getElementById('remoteVideos').appendChild(el);
+        if (role === 'teacher') {
+            document.getElementById('teacher-controls').classList.remove('hidden');
+        } else if (role === 'student') {
+            document.getElementById('student-view').classList.remove('hidden');
+            connectToRoom('student');
+        }
+    }
 
-                event.track.onmute = function(event) {
-                    el.play();
+    // Функция для начала трансляции экрана (для учителя)
+    function startBroadcast() {
+        // Запрашиваем разрешение на захват экрана
+        navigator.mediaDevices.getDisplayMedia({ video: true })
+            .then(stream => {
+                screenStream = stream;
+
+                // Создаем WebSocket соединение
+                socket = new WebSocket('ws://' + location.host + '/websocket?role=teacher');
+                socket.onopen = () => {
+                    console.log('Connected to WebSocket as teacher');
+                    setupPeerConnection('teacher', screenStream);
                 };
 
-                event.streams[0].onremovetrack = ({track}) => {
-                    if (el.parentNode) {
-                        el.parentNode.removeChild(el);
-                    }
-                };
+                socket.onmessage = handleSocketMessage;
+
+                document.getElementById('start-broadcast').classList.add('hidden');
+                document.getElementById('stop-broadcast').classList.remove('hidden');
+            })
+            .catch(err => {
+                console.error('Error capturing screen: ', err);
+            });
+    }
+
+    // Функция для остановки трансляции (для учителя)
+    function stopBroadcast() {
+        if (peerConnection) {
+            peerConnection.close();
+        }
+        if (screenStream) {
+            screenStream.getTracks().forEach(track => track.stop());
+        }
+        if (socket) {
+            socket.close();
+        }
+
+        document.getElementById('start-broadcast').classList.remove('hidden');
+        document.getElementById('stop-broadcast').classList.add('hidden');
+    }
+
+    // Функция для подключения ученика
+    function connectToRoom(role) {
+        socket = new WebSocket('ws://' + location.host + '/websocket?role=' + role);
+        socket.onopen = () => {
+            console.log('Connected to WebSocket as student');
+            setupPeerConnection('student');
+        };
+
+        socket.onmessage = handleSocketMessage;
+    }
+
+    // Обработка сообщений от WebSocket
+    function handleSocketMessage(event) {
+        const message = JSON.parse(event.data);
+
+        switch (message.event) {
+            case 'offer':
+                handleOffer(message.data);
+                break;
+            case 'candidate':
+                handleCandidate(message.data);
+                break;
+            case 'answer':
+                handleAnswer(message.data);
+                break;
+            default:
+                console.error('Unknown message type:', message);
+        }
+    }
+
+    // Установка peer connection для учителя или ученика
+    function setupPeerConnection(role, stream = null) {
+        peerConnection = new RTCPeerConnection();
+
+        // Если это ученик, получаем только видеопоток
+        if (role === 'student') {
+            peerConnection.ontrack = (event) => {
+                // Просмотр полученного видео
+                videoElement.srcObject = event.streams[0];
             };
+        } else if (role === 'teacher' && stream) {
+            // Для учителя: отправляем захваченный экран
+            stream.getTracks().forEach(track => peerConnection.addTrack(track, stream));
+        }
 
-            document.getElementById('localVideo').srcObject = stream; // Отобразить поток экрана
-            stream.getTracks().forEach(track => pc.addTrack(track, stream));
+        // Устанавливаем обработчики для ICE кандидатов
+        peerConnection.onicecandidate = (event) => {
+            if (event.candidate) {
+                socket.send(JSON.stringify({
+                    event: 'candidate',
+                    data: JSON.stringify(event.candidate)
+                }));
+            }
+        };
+    }
 
-            let ws = new WebSocket("{{.}}");
-            pc.onicecandidate = e => {
-                if (!e.candidate) {
-                    return;
-                }
+    // Обработка SDP offer
+    function handleOffer(offerData) {
+        const offer = JSON.parse(offerData);
+        peerConnection.setRemoteDescription(new RTCSessionDescription(offer))
+            .then(() => {
+                return peerConnection.createAnswer();
+            })
+            .then((answer) => {
+                return peerConnection.setLocalDescription(answer);
+            })
+            .then(() => {
+                socket.send(JSON.stringify({
+                    event: 'answer',
+                    data: JSON.stringify(peerConnection.localDescription)
+                }));
+            })
+            .catch((error) => {
+                console.error('Error handling offer:', error);
+            });
+    }
 
-                ws.send(JSON.stringify({event: 'candidate', data: JSON.stringify(e.candidate)}));
-            };
+    // Обработка ICE кандидатов
+    function handleCandidate(candidateData) {
+        const candidate = JSON.parse(candidateData);
+        peerConnection.addIceCandidate(new RTCIceCandidate(candidate))
+            .catch((error) => {
+                console.error('Error adding received ICE candidate', error);
+            });
+    }
 
-            ws.onclose = function(evt) {
-                window.alert("Websocket has closed");
-            };
-
-            ws.onmessage = function(evt) {
-                let msg = JSON.parse(evt.data);
-                if (!msg) {
-                    return console.log('failed to parse msg');
-                }
-
-                switch (msg.event) {
-                    case 'offer':
-                        let offer = JSON.parse(msg.data);
-                        if (!offer) {
-                            return console.log('failed to parse offer');
-                        }
-                        pc.setRemoteDescription(offer).then(() => {
-                            return pc.createAnswer();
-                        }).then(answer => {
-                            return pc.setLocalDescription(answer);
-                        }).then(() => {
-                            ws.send(JSON.stringify({event: 'answer', data: JSON.stringify(pc.localDescription)}));
-                        });
-                        return;
-
-                    case 'candidate':
-                        let candidate = JSON.parse(msg.data);
-                        if (!candidate) {
-                            return console.log('failed to parse candidate');
-                        }
-
-                        pc.addIceCandidate(candidate);
-                }
-            };
-
-            ws.onerror = function(evt) {
-                console.log("ERROR: " + evt.data);
-            };
-        }).catch(window.alert);
+    // Обработка SDP answer
+    function handleAnswer(answerData) {
+        const answer = JSON.parse(answerData);
+        peerConnection.setRemoteDescription(new RTCSessionDescription(answer));
+    }
 </script>
 
+</body>
 </html>
